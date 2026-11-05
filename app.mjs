@@ -132,7 +132,7 @@ $('send').addEventListener('click',async()=>{
  try{
   const result=await ton.sendTransaction({validUntil:Math.floor(Date.now()/1000)+300,network:'-239',from:wallet.account.address,messages:pick.map(r=>({address:r.address,amount:plan.amountNanos,payload:plan.payload}))});
   if(!result?.boc)throw new Error('钱包没有返回可核验的签名 BoC；付款状态不确定');
-  const signed=core.Cell.fromBoc(b64Bytes(result.boc))[0];const h=hex(signed.hash());
+  const signed=core.Cell.fromBase64(result.boc);const h=hex(signed.hash());
   for(const r of pick)storeAttempt(senderBefore,snap,r,{status:'钱包已返回签名·链上待核实',externalHash:h});
   progress(`钱包已返回签名 BoC，外部消息 hash：${h}。这不代表收款到账，请点击「检查待确认交易」。`,'ok');
   log(`已收到钱包签名；${pick.length} 笔待链上核验；externalHash ${h}`);
@@ -150,7 +150,7 @@ async function txByMessage(hash){
  const j=await r.json();return Array.isArray(j.transactions)?j.transactions:[];
 }
 function decodedMemo(message){
- try{const b=message?.message_content?.body;if(!b)return null;const c=core.Cell.fromBoc(b64Bytes(b))[0];const s=c.beginParse();if(s.loadUint(32)!==0)return null;return s.loadStringTail();}catch{return null;}
+ try{const b=message?.message_content?.body;if(!b)return null;const c=core.Cell.fromBase64(b);const s=c.beginParse();if(s.loadUint(32)!==0)return null;return s.loadStringTail();}catch{return null;}
 }
 async function verifyGroup(externalHash,records,expectedMemo){
  const rootTxs=await txByMessage(externalHash);if(!rootTxs.length)return {kind:'pending',message:'外部消息尚未在索引中找到'};
