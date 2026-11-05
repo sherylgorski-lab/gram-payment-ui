@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GRAM 批量付款 · Tonkeeper 授权版</title><link rel="icon" href="icon-180.png"><link rel="stylesheet" href="style.css">
+<script defer src="https://unpkg.com/@tonconnect/ui@5.0.2/dist/tonconnect-ui.min.js"></script>
+<script type="module" src="app.mjs"></script></head><body>
+<main class="wrap">
+<header class="top"><div><div class="eyebrow">GRAM · TON MAINNET</div><h1>Tonkeeper 批量付款</h1><p>统一金额 · 完全一致的评论 · 不在电脑脚本里存储私钥</p></div><div class="tag">用户确认后才付款</div></header>
+<div id="banner" class="notice">正在检查运行环境…</div>
+<section class="card"><div class="secthead"><h2>① 连接付款钱包</h2><span class="small">查询 Session 与付款钱包完全分离</span></div>
+<div class="row wraprow"><div id="ton-connect"></div><div id="wallet-info" class="mono muted">尚未连接</div><button class="ghost" id="balance-btn">查询链上余额</button></div>
+<div class="muted small" id="wallet-capacity">一次可发送的消息数以 Tonkeeper 连接结果为准</div></section>
+<section class="card"><div class="secthead"><h2>② 收款名单</h2><div class="row"><label class="filebutton">导入查询 TXT<input id="recipients-file" type="file" accept=".txt,text/plain"></label><label class="filebutton">导入付款草稿 JSON<input id="plan-file" type="file" accept=".json,application/json"></label></div></div>
+<label for="recipients">每行一个地址，或者使用 <code>@用户名----UQ地址</code></label><textarea id="recipients" class="mono" rows="7" placeholder="@username----UQ...\nUQ..."></textarea>
+<div class="row wraprow inputrow"><div><label for="amount">每个地址金额 · GRAM</label><input id="amount" type="text" value="0.1" inputmode="decimal"></div><div><label for="batch-size">本次最多发送几笔</label><select id="batch-size"><option>1</option><option selected>4</option><option>20</option><option>50</option><option>255</option></select></div><div class="muted small">实际每批取「设置值」与「钱包支持上限」的较小值</div></div></section>
+<section class="card"><div class="secthead"><h2>③ 统一评论</h2><label class="filebutton">导入 comment_utf8.txt<input type="file" accept=".txt,text/plain" id="comment-file"></label></div>
+<p class="muted small">精确保留 Emoji、空行、缩进、特殊符号和最后的换行。不去空格、不归一化、不截断。HTML 文本框采用 LF 换行；含 CR 的文件会拒绝。</p>
+<textarea id="memo" rows="7" placeholder="🎉 活动通知\n\n💎 统一评论内容"></textarea>
+<details><summary>显示不可见字符（只用于核对，不改变原文）</summary><pre id="memo-markers" class="debug"></pre></details>
+<div class="row stats"><span id="memo-info" class="muted small">评论尚未检查</span><span id="memo-sha" class="mono muted tiny"></span></div></section>
+<section class="card"><div class="secthead"><h2>④ 付款清单与审核</h2><button id="validate" class="primary">校验并生成付款预览</button></div>
+<div class="statsgrid"><div><span>收款地址</span><b id="count">—</b></div><div><span>每人金额</span><b id="per">—</b></div><div><span>本金合计</span><b id="total">—</b></div><div><span>网络手续费</span><b>由 Tonkeeper 显示</b></div></div>
+<div id="summary" class="muted small">先填写信息，再点击预览。</div>
+<div class="tablebox"><table><thead><tr><th>序号</th><th>用户名</th><th>地址</th><th>金额</th><th>付款记录</th></tr></thead><tbody id="rows"></tbody></table></div>
+<label class="check"><input type="checkbox" id="approved"> 我已逐项核对收款地址、金额、评论，明白链上转账通常不可撤销；只向有权发送的地址付款。</label>
+<div class="row wraprow"><button id="send" class="danger" disabled>请先预览并连接钱包</button><button id="verify" class="ghost">检查待确认交易</button><button id="export-ledger" class="ghost">备份付款记录 JSON</button><label class="filebutton">恢复付款记录<input type="file" id="ledger-file" accept=".json,application/json"></label></div>
+<div id="progress" class="notice subdued">尚未发送。任何失败或超时都会锁定该批，不会自动重试付款。</div></section>
+<section class="card"><h2>⑤ 付款记录和风控</h2><p class="muted small">钱包签名/提交 ≠ 链上到账。链上核验会尝试查询实际出账消息；无法查证时状态保持「待核实」，不自动再次发送。记录保存在当前浏览器中，重装服务器前要导出备份。</p>
+<div class="row"><button id="export-plan" class="ghost">导出当前付款草稿</button><button id="export-log" class="ghost">导出操作日志</button></div><pre id="log" class="log"></pre></section>
+<footer>只接收用户手动发起的付款请求 · 不索取助记词/私钥 · 资产为 TON 主网原生 GRAM · 此工具不提供资金托管</footer>
+</main></body></html>
