@@ -89,9 +89,12 @@ export const EXPLICIT_CANCEL_PAYMENT_STATUSES=new Set([
 export function isRetryablePaymentRecord(record){
   return !!record && RETRYABLE_PAYMENT_STATUSES.has(record.status);
 }
+// Any transaction hash is evidence that must be preserved and verified.
+// Legacy manual-no-send metadata must never override an existing hash.
 export function hasPaymentProof(record){
-  return !!record && ((typeof record.externalHash==='string' && record.externalHash.length>0) ||
-    (typeof record.recipientMessageHash==='string' && record.recipientMessageHash.length>0));
+  if(!record)return false;
+  return ['externalHash','recipientMessageHash','outgoingHash','recipientTxHash']
+    .some(key=>typeof record[key]==='string' && record[key].length>0);
 }
 
 // Historical attempts are matched independently of memo hash. The memo hash stays
@@ -118,15 +121,25 @@ export function isReviewablePaymentHistory(entries){
 }
 export function isSendablePaymentHistory(entries){
   if(!Array.isArray(entries)||!entries.length)return true;
-  return entries.every(x=>(isRetryablePaymentRecord(x?.record)&&!hasPaymentProof(x?.record))||isConfirmedPaidRecord(x?.record));
+  // User-requested policy: a prior attempt with any transaction hash no longer
+  // blocks a new manual send. Keep the evidence in the ledger and surface a
+  // warning in the UI; do not silently delete or downgrade that attempt.
+  // Hashless unknown outcomes and unreviewed cancellations remain blocked.
+  return entries.every(x=>{
+    const record=x?.record;
+    if(!record)return false;
+    if(isConfirmedPaidRecord(record)||hasPaymentProof(record))return true;
+    return isRetryablePaymentRecord(record);
+  });
 }
 export function blockingPaymentAttempts(attempts,sender,amountNanos){
   return Object.entries(attempts||{}).filter(([,record])=>{
     if(!record||record.sender!==sender||String(record.amountNanos)!==String(amountNanos))return false;
-    const noProof=!hasPaymentProof(record);
-    const reviewedNoSend=isRetryablePaymentRecord(record)&&noProof;
-    const explicitCancel=record.status==='用户已取消·未签名'&&noProof;
-    return !reviewedNoSend&&!explicitCancel&&!isConfirmedPaidRecord(record);
+    // Hashed attempts are deliberately not a send lock under the new policy.
+    if(hasPaymentProof(record)||isConfirmedPaidRecord(record))return false;
+    const reviewedNoSend=isRetryablePaymentRecord(record);
+    const explicitCancel=record.status==='用户已取消·未签名';
+    return !reviewedNoSend&&!explicitCancel;
   });
 }
 export function reviewablePaymentAttempts(entries,statusSet){
