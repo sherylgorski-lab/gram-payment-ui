@@ -1,4 +1,4 @@
-import {parseAmount,amountString,rowsOf,exactMemo,sha256String,getMaxMessages,readableError,stableGroup,canonicalRecipientKey} from './logic.mjs';
+import {parseAmount,amountString,rowsOf,exactMemo,sha256String,getMaxMessages,readableError,stableGroup,canonicalRecipientKey,tonConnectErrorCode,isTonConnectUserRejection,isRetryablePaymentRecord} from './logic.mjs';
 const $=id=>document.getElementById(id);
 const LEDGER_KEY='gram_tonkeeper_payment_ledger_v1';
 let ton=null, core=null, wallet=null, plan=null, busy=false, connectingReady=false;
@@ -9,12 +9,14 @@ function saveLedger(){localStorage.setItem(LEDGER_KEY,JSON.stringify(ledger));}
 function info(msg,kind=''){const el=$('banner');el.textContent=msg;el.className='notice '+kind;}
 function progress(s,kind=''){const el=$('progress');el.textContent=s;el.className='notice '+(kind||'subdued');}
 function log(msg){const line=`${new Date().toLocaleString()} | ${msg}`;logs.push(line); $('log').textContent=logs.slice(-100).join('\n');}
-function setSendLabel(){const n=plan?.recipients.filter(r=>!getRecord(r))?.length||0; $('send').textContent=busy?'操作处理中…':(n?'向 Tonkeeper 提交下一批（'+n+'条待分配）':'无可发送的记录');$('send').disabled=busy||!plan||!wallet||!connectingReady||!$('approved').checked||!n;}
+function setSendLabel(){const n=pendingRecipients().length; $('send').textContent=busy?'操作处理中…':(n?'向 Tonkeeper 提交下一批（'+n+'条待审核）':'无可发送的记录');$('send').disabled=busy||!plan||!wallet||!connectingReady||!$('approved').checked||!n;}
 function rawAddr(addr){return core.Address.parse(addr).toRawString();}
 function walletRaw(){return wallet?rawAddr(wallet.account.address):'';}
 function normalizeAddress(str){const parsed=core.Address.parseFriendly(str);if(parsed.isTestOnly)throw new Error('检测到测试网地址，当前仅支持主网');return {raw:parsed.address.toRawString(),address:parsed.address.toString({urlSafe:true,testOnly:false,bounceable:parsed.isBounceable})};}
 function recordKey(r){return canonicalRecipientKey(walletRaw(),r.raw,plan.amountNanos,plan.memoHash);}
 function getRecord(r){return wallet&&plan?ledger.attempts[recordKey(r)]:null;}
+function isSendableRecord(r){const a=getRecord(r);return !a||isRetryablePaymentRecord(a);}
+function pendingRecipients(){return plan?plan.recipients.filter(isSendableRecord):[];}
 async function cryptoHex(bytes){const digest=await crypto.subtle.digest('SHA-256',bytes);return [...new Uint8Array(digest)].map(x=>x.toString(16).padStart(2,'0')).join('');}
 function hex(bytes){return [...new Uint8Array(bytes)].map(x=>x.toString(16).padStart(2,'0')).join('');}
 function b64Bytes(s){return Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/')),c=>c.charCodeAt(0));}
@@ -111,13 +113,24 @@ $('plan-file').addEventListener('change',async e=>{
 });
 function storeAttempt(sender,snap,rec,fields){
  const key=canonicalRecipientKey(sender,rec.raw,snap.amountNanos,snap.memoHash);
- ledger.attempts[key]={...(ledger.attempts[key]||{}),...fields,sender,recipient:rec.raw,username:rec.username,amountNanos:snap.amountNanos,memoHash:snap.memoHash,planHash:snap.planHash,updatedAt:new Date().toISOString()};saveLedger();
+ const previous=ledger.attempts[key]||{};
+ const updatedAt=new Date().toISOString();
+ const history=Array.isArray(previous.history)?[...previous.history]:[];
+ // Preserve the pre-upgrade status the first time this record is touched by V2.
+ if(previous.status && !history.length){
+  history.push({at:previous.updatedAt||updatedAt,status:previous.status,error:previous.error||undefined,legacy:true});
+ }
+ const event={at:updatedAt,status:fields.status||previous.status||'记录更新'};
+ if(fields.error)event.error=String(fields.error).slice(0,500);
+ if(fields.verifyDetail)event.detail=String(fields.verifyDetail).slice(0,500);
+ history.push(event);
+ ledger.attempts[key]={...previous,...fields,history:history.slice(-50),sender,recipient:rec.raw,username:rec.username,amountNanos:snap.amountNanos,memoHash:snap.memoHash,planHash:snap.planHash,updatedAt};saveLedger();
 }
 function markAttempt(rec,fields){storeAttempt(walletRaw(),plan,rec,fields);}
 $('send').addEventListener('click',async()=>{
  if(busy||!wallet||!plan||!connectingReady||!$('approved').checked)return;
  if(wallet.account.chain!=='-239'){progress('当前钱包不是 TON 主网，已阻止付款','warn');return;}
- const free=plan.recipients.filter(r=>!getRecord(r));if(!free.length)return;
+ const free=pendingRecipients();if(!free.length)return;
  const cap=getCap();if(cap<1)return;
  const pick=free.slice(0,cap);
  if(pick.some(x=>x.raw===walletRaw())){progress('收款清单包含付款钱包自身地址，已停止；请复核','warn');return;}
@@ -137,11 +150,54 @@ $('send').addEventListener('click',async()=>{
   progress(`钱包已返回签名 BoC，外部消息 hash：${h}。这不代表收款到账，请点击「检查待确认交易」。`,'ok');
   log(`已收到钱包签名；${pick.length} 笔待链上核验；externalHash ${h}`);
  }catch(e){
-  // Even a thrown exception may follow a dispatched or broadcast request.
-  for(const r of pick)storeAttempt(senderBefore,snap,r,{status:'付款结果不确定·禁止自动重试',error:readableError(e)});
-  progress('付款请求返回错误或结果未知：'+readableError(e)+'。该批已锁定；必须人工查链上记录，不能直接再发。','warn');
-  log('钱包交互异常，付款状态未知并锁定该批：'+readableError(e));
+  // Only the wallet's explicit USER_REJECTS_ERROR (300) is a definite cancel.
+  // Generic UI errors such as "Transaction was not sent" remain uncertain.
+  const rejected=isTonConnectUserRejection(e);
+  const code=tonConnectErrorCode(e);
+  const errorText=`${e?.name||e?.constructor?.name||'Error'}${code!==null?' (code '+code+')':''}: ${readableError(e)}`;
+  if(rejected){
+   for(const r of pick)storeAttempt(senderBefore,snap,r,{status:'用户已取消·未签名',error:errorText,cancelCode:300,externalHash:null,recipientMessageHash:null});
+   progress('Tonkeeper 明确返回用户取消（300）。本批未获得签名；记录已保留。若要再次提交，请先点击「重新审核明确取消记录」，再重新勾选付款确认。','warn');
+   log('钱包明确返回 USER_REJECTS_ERROR 300；本批标记为用户取消，等待人工重新审核');
+  }else{
+   for(const r of pick)storeAttempt(senderBefore,snap,r,{status:'付款结果不确定·禁止自动重试',error:errorText});
+   progress('付款请求返回错误或结果未知：'+errorText+'。该批继续锁定；先核对 Tonkeeper 历史，确认没有签名/出账后才能人工重新审核。','warn');
+   log('钱包交互异常，付款状态未知并锁定该批：'+errorText);
+  }
  }finally{busy=false;paintTable();}
+});
+function currentPlanRecords(predicate){
+ if(!wallet||!plan)return [];
+ return plan.recipients.filter(r=>predicate(getRecord(r),r));
+}
+$('review-cancelled').addEventListener('click',()=>{
+ if(busy||!wallet||!plan){progress('请先连接原付款钱包并载入原付款清单','warn');return;}
+ const items=currentPlanRecords(a=>a?.status==='用户已取消·未签名');
+ if(!items.length){progress('当前清单没有钱包明确返回取消代码 300 的记录');return;}
+ if(!confirm(`找到 ${items.length} 条钱包明确返回 USER_REJECTS_ERROR（300）的取消记录。该状态表示钱包拒绝了本次请求、工具未收到签名结果。现在将它们重新加入待审核清单吗？不会自动发送。`))return;
+ const at=new Date().toISOString();
+ for(const r of items)storeAttempt(walletRaw(),plan,r,{status:'用户已取消·已重新审核',reviewedAt:at,reviewMode:'wallet-explicit-rejection-300'});
+ $('approved').checked=false;paintTable();
+ progress(`已将 ${items.length} 条明确取消记录重新加入待审核清单。请再次检查地址、金额和评论，并重新勾选确认；不会自动发送。`,'ok');
+ log(`人工重新审核 ${items.length} 条明确取消记录；需要再次勾选确认并手动提交`);
+});
+$('review-unknown').addEventListener('click',()=>{
+ if(busy||!wallet||!plan){progress('请先连接原付款钱包并载入原付款清单','warn');return;}
+ const items=currentPlanRecords(a=>a&&['付款结果不确定·禁止自动重试','已请求钱包确认·请核实'].includes(a.status)&&!a.externalHash);
+ if(!items.length){progress('当前清单没有可进行人工未发送确认的无签名哈希记录。已有签名哈希或其他核验状态的记录必须先查链上。');return;}
+ const ok=confirm(`将检查 ${items.length} 条结果未知且没有签名哈希的记录。
+
+只有在你已经检查原付款钱包的对应时间段，确认没有这批交易的出账记录、没有完成签名，并确认本次请求确实取消时，才可以继续。
+
+如果你不能确定，请点“取消”，继续保持锁定。
+
+确认后仅重新加入待审核清单，不会自动发送。`);
+ if(!ok)return;
+ const at=new Date().toISOString();
+ for(const r of items)storeAttempt(walletRaw(),plan,r,{status:'人工确认未发送·已重新审核',manualNoSendConfirmedAt:at,reviewMode:'user-attested-no-signature-or-outgoing-tx'});
+ $('approved').checked=false;paintTable();
+ progress(`已将 ${items.length} 条记录重新加入待审核清单。请再次核对完整清单并重新勾选确认；不会自动发送。`,'ok');
+ log(`用户人工确认 ${items.length} 条无签名哈希记录未发送；保留原始异常和审核历史`);
 });
 const sleep=ms=>new Promise(ok=>setTimeout(ok,ms));
 async function txByMessage(hash){
