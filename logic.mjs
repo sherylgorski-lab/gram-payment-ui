@@ -50,6 +50,15 @@ export function stableGroup(plan){
 export function canonicalRecipientKey(sender,rcpt,amountNanos,memoHash){
   return `${sender}|${rcpt}|${amountNanos}|${memoHash}`;
 }
+export function uniqueAttemptKey(sender,rcpt,amountNanos,memoHash,attemptId){
+  if(typeof attemptId!=='string'||! /^[A-Za-z0-9-]{8,80}$/.test(attemptId))throw new Error('付款尝试 ID 格式不正确');
+  return `${canonicalRecipientKey(sender,rcpt,amountNanos,memoHash)}|attempt:${attemptId}`;
+}
+export function getSafeBatchSize(requested,walletMax){
+  const a=Number(requested),b=Number(walletMax);
+  if(!Number.isFinite(a)||!Number.isFinite(b)||a<=0||b<=0)return 0;
+  return Math.max(0,Math.min(90,Math.floor(a),Math.floor(b)));
+}
 
 
 // TON Connect sendTransaction rejection helpers. Only an explicit wallet rejection
@@ -94,15 +103,35 @@ export function matchingPaymentAttempts(attempts,sender,recipient,amountNanos){
     .map(([key,record])=>({key,record}))
     .sort((a,b)=>String(a.record.attemptedAt||a.record.updatedAt||'').localeCompare(String(b.record.attemptedAt||b.record.updatedAt||'')));
 }
+export const CONFIRMED_PAYMENT_STATUS='链上收款侧已核实';
+export function isConfirmedPaidRecord(record){
+  return !!record && record.status===CONFIRMED_PAYMENT_STATUS &&
+    typeof record.outgoingHash==='string' && record.outgoingHash.length>0 &&
+    typeof record.recipientTxHash==='string' && record.recipientTxHash.length>0;
+}
 export function isReviewablePaymentHistory(entries){
-  if(!Array.isArray(entries)||!entries.length||entries.some(x=>hasPaymentProof(x?.record)))return false;
+  if(!Array.isArray(entries)||!entries.length)return false;
   const allowed=new Set([...UNKNOWN_PAYMENT_STATUSES,...EXPLICIT_CANCEL_PAYMENT_STATUSES,...RETRYABLE_PAYMENT_STATUSES]);
-  return entries.every(x=>allowed.has(x?.record?.status));
+  const candidates=entries.filter(x=>allowed.has(x?.record?.status));
+  // An older confirmed payment must not block review of a separate no-hash attempt.
+  return candidates.length>0 && candidates.every(x=>!hasPaymentProof(x?.record));
 }
 export function isSendablePaymentHistory(entries){
-  return !Array.isArray(entries)||!entries.length||entries.every(x=>isRetryablePaymentRecord(x?.record));
+  if(!Array.isArray(entries)||!entries.length)return true;
+  return entries.every(x=>(isRetryablePaymentRecord(x?.record)&&!hasPaymentProof(x?.record))||isConfirmedPaidRecord(x?.record));
+}
+export function blockingPaymentAttempts(attempts,sender,amountNanos){
+  return Object.entries(attempts||{}).filter(([,record])=>{
+    if(!record||record.sender!==sender||String(record.amountNanos)!==String(amountNanos))return false;
+    const noProof=!hasPaymentProof(record);
+    const reviewedNoSend=isRetryablePaymentRecord(record)&&noProof;
+    const explicitCancel=record.status==='用户已取消·未签名'&&noProof;
+    return !reviewedNoSend&&!explicitCancel&&!isConfirmedPaidRecord(record);
+  });
 }
 export function reviewablePaymentAttempts(entries,statusSet){
-  if(!isReviewablePaymentHistory(entries))return [];
-  return entries.filter(x=>statusSet?.has(x?.record?.status));
+  if(!Array.isArray(entries)||!statusSet)return [];
+  const targets=entries.filter(x=>statusSet.has(x?.record?.status));
+  if(!targets.length||targets.some(x=>hasPaymentProof(x?.record)))return [];
+  return targets;
 }
