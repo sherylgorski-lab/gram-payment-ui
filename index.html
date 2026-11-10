@@ -24,7 +24,7 @@
 <label class="check"><input type="checkbox" id="approved"> 我已逐项核对收款地址、金额、评论，明白链上转账通常不可撤销；只向有权发送的地址付款。</label>
 <div class="row wraprow"><button id="send" class="danger" disabled>请先预览并连接钱包</button><button id="verify" class="ghost">检查待确认交易</button><button id="review-cancelled" class="ghost">重新审核明确取消记录</button><button id="review-unknown" class="ghost">人工确认未发送（先核对钱包历史）</button><button id="export-ledger" class="ghost">备份付款记录 JSON</button><label class="filebutton">恢复付款记录<input type="file" id="ledger-file" accept=".json,application/json"></label></div>
 <div id="progress" class="notice subdued">明确取消会单独记录；连接中断、超时或结果未知仍会锁定。重新审核不会自动发送，必须再次核对并手动确认。</div></section>
-<section class="card"><h2>⑤ 付款记录和风控</h2><p class="muted small">钱包明确返回取消代码 300 时会标记为「用户已取消·未签名」。通用错误、超时和断线仍按结果未知锁定；只有检查钱包历史后，才能使用人工确认入口重新审核。重新审核只把记录放回待审核清单，不会自动发送。每次状态变化保留最近 50 条历史。记录保存在当前浏览器中，重装服务器前要导出备份。</p>
+<section class="card"><h2>⑤ 付款记录和风控</h2><p class="muted small">V2.1 按付款钱包、收款地址和金额匹配全部历史尝试，不再用评论SHA256把同一付款拆成互不相认的记录；同一地址不同评论的多次尝试会一起锁定审核。钱包明确返回取消代码 300 时会标记为「用户已取消·未签名」。通用错误、超时和断线仍按结果未知锁定；只有逐一检查所有历史时间段的钱包出账记录后，才能使用人工确认入口重新审核。「Transaction was not sent」本身不能证明未广播。任何签名/收款消息哈希或其他链上核验状态都不能用人工未发送确认解锁，必须先查链上。重新审核只把记录放回待审核清单，不会自动发送。每次状态变化保留最近 50 条历史。记录保存在当前浏览器中，重装服务器前要导出备份。</p>
 <div class="row"><button id="export-plan" class="ghost">导出当前付款草稿</button><button id="export-log" class="ghost">导出操作日志</button></div><pre id="log" class="log"></pre></section>
 <footer>只接收用户手动发起的付款请求 · 不索取助记词/私钥 · 资产为 TON 主网原生 GRAM · 此工具不提供资金托管</footer>
 </main></body></html>
