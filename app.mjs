@@ -11,15 +11,19 @@ function saveLedger(){localStorage.setItem(LEDGER_KEY,JSON.stringify(ledger));}
 function info(msg,kind=''){const el=$('banner');el.textContent=msg;el.className='notice '+kind;}
 function progress(s,kind=''){const el=$('progress');el.textContent=s;el.className='notice '+(kind||'subdued');}
 function log(msg){const line=`${new Date().toLocaleString()} | ${msg}`;logs.push(line); $('log').textContent=logs.slice(-100).join('\n');}
+function blockedAddressCount(){
+ return new Set(batchBlockingAttempts().map(([,record])=>record.recipient)).size;
+}
 function setSendLabel(){
- const n=pendingRecipients().length, blockers=batchBlockingAttempts().length;
+ const n=pendingRecipients().length, blocked=blockedAddressCount();
  const paidReady=plan?plan.recipients.filter(r=>{const e=recordEntries(r);return isSendablePaymentHistory(e)&&e.some(x=>isConfirmedPaidRecord(x.record))&&!paidThisRun.has(r.raw);}).length:0;
  if(busy)$('send').textContent='操作处理中…';
- else if(blockers)$('send').textContent=`先核验上一批（${blockers}条）`;
- else if(n)$('send').textContent='向 Tonkeeper 提交下一批（本批最多90条）';
+ else if(n)$('send').textContent=blocked?`向 Tonkeeper 提交下一批（另跳过${blocked}个待核验地址）`:'向 Tonkeeper 提交下一批（本批最多90条）';
+ else if(blocked)$('send').textContent=`待核验地址仍锁定（${blocked}个）`;
  else if(paidReady&&!$('allow-repeat-paid').checked)$('send').textContent='已付款地址需勾选后才能再次付款';
  else $('send').textContent='无可发送的记录';
- $('send').disabled=busy||!plan||!wallet||!connectingReady||!$('approved').checked||!n||blockers>0;
+ // A pending/uncertain attempt locks only its own recipient, not unrelated addresses.
+ $('send').disabled=busy||!plan||!wallet||!connectingReady||!$('approved').checked||!n;
 }
 function rawAddr(addr){return core.Address.parse(addr).toRawString();}
 function walletRaw(){return wallet?rawAddr(wallet.account.address):'';}
@@ -92,7 +96,7 @@ function resetPreview(){plan=null;paidThisRun=new Set();$('approved').checked=fa
 function markMemo(){const s=$('memo').value;const bytes=new TextEncoder().encode(s);$('memo-info').textContent=`${bytes.length} UTF-8 字节 | ${s.split('\n').length} 行 | ${s.endsWith('\n')?'末尾有换行':'末尾无换行'}`;$('memo-markers').textContent=s.replaceAll(' ','·').replaceAll('\t','⇥').replaceAll('\n','↵\n');$('memo-sha').textContent='';}
 for(const id of ['recipients','memo','amount','batch-size'])$(id).addEventListener('input',()=>{resetPreview();if(id==='memo')markMemo();});
 $('approved').addEventListener('change',setSendLabel);
-$('allow-repeat-paid').addEventListener('change',()=>{paintTable();progress($('allow-repeat-paid').checked?'已启用重复付款：仅允许链上确认到账且无未核验历史尝试的地址进入新付款批次。请逐项核对后再确认。':'已关闭重复付款：已链上确认的历史付款地址不会进入本轮待付款队列。','warn');});
+$('allow-repeat-paid').addEventListener('change',()=>{paintTable();progress($('allow-repeat-paid').checked?'已启用重复付款：链上确认到账的地址可再次进入付款队列；仍有未核验历史尝试的地址继续单独锁定。请逐项核对。':'已关闭重复付款：已链上确认的历史付款地址不会进入本轮待付款队列。','warn');});
 function paintTable(){
  const target=$('rows');target.replaceChildren();if(!plan)return;
  for(const [i,r] of plan.recipients.entries()){
@@ -213,8 +217,14 @@ function markAttempt(rec,fields){storeAttempt(walletRaw(),plan,rec,fields);}
 $('send').addEventListener('click',async()=>{
  if(busy||!wallet||!plan||!connectingReady||!$('approved').checked)return;
  if(wallet.account.chain!=='-239'){progress('当前钱包不是 TON 主网，已阻止付款','warn');return;}
- const blockers=batchBlockingAttempts();if(blockers.length){progress(`上一批仍有 ${blockers.length} 条历史尝试未完成链上核验或人工复核，暂时不能提交下一批。请先处理上一批。`,'warn');return;}
- const free=pendingRecipients();if(!free.length)return;
+ const free=pendingRecipients();
+ if(!free.length){
+  const blocked=blockedAddressCount();
+  progress(blocked?`当前没有可发送地址；${blocked}个地址仍有签名/结果未知的历史尝试，必须先核验这些地址。`:'当前没有可发送的记录。请检查重复付款选项和付款清单。','warn');
+  return;
+ }
+ // Unresolved attempts lock only their own recipient; unrelated clean recipients can proceed.
+ const blocked=blockedAddressCount();
  const cap=getCap();if(cap<1)return;
  const pick=free.slice(0,cap);
  if(pick.length>90){progress('本工具单批硬上限为90条，已阻止超限提交。','warn');return;}
@@ -223,12 +233,13 @@ $('send').addEventListener('click',async()=>{
  const total=BigInt(plan.amountNanos)*BigInt(pick.length);
  const repeatCount=pick.filter(r=>recordEntries(r).some(x=>isConfirmedPaidRecord(x.record))).length;
  const repeatNotice=repeatCount?`\n其中 ${repeatCount} 个地址此前已链上确认到账，本批将再次付款。`:'\n本批不包含此前已链上确认到账的重复付款地址。';
- const dialog=`即将请求 Tonkeeper 签名主网转账\n\n付款钱包：${wallet.account.address}\n本批收款：${pick.length} 条\n每笔：${amountString(BigInt(plan.amountNanos))} GRAM\n本批本金：${amountString(total)} GRAM + 手续费\n评论SHA256：${plan.memoHash}${repeatNotice}\n\n签名确认后可能立即发生真实不可撤销付款。\n请先在 Tonkeeper 中再次核对收款地址与金额。\n\n要继续打开 Tonkeeper 确认吗？`;
+ const skipNotice=blocked?`\n另有 ${blocked} 个地址存在未核验历史，本轮已单独跳过；不会阻止本批其他无异常地址付款。`:'';
+ const dialog=`即将请求 Tonkeeper 签名主网转账\n\n付款钱包：${wallet.account.address}\n本批收款：${pick.length} 条\n每笔：${amountString(BigInt(plan.amountNanos))} GRAM\n本批本金：${amountString(total)} GRAM + 手续费\n评论SHA256：${plan.memoHash}${repeatNotice}${skipNotice}\n\n签名确认后可能立即发生真实不可撤销付款。\n请先在 Tonkeeper 中再次核对收款地址与金额。\n\n要继续打开 Tonkeeper 确认吗？`;
  if(!confirm(dialog))return;
  busy=true;setSendLabel();
  const at=new Date().toISOString();
  for(const r of pick)storeAttempt(senderBefore,snap,r,{status:'已请求钱包确认·请核实',attemptedAt:at,externalHash:null,recipientMessageHash:null});
- paintTable();progress('已记录发起尝试。请在 Tonkeeper 内逐项检查；任何异常都不要盲目重发。');
+ paintTable();progress('已记录本批发起尝试。请在 Tonkeeper 内逐项检查；任何异常都不要盲目重发。'+(blocked?` 本轮另跳过 ${blocked} 个待核验地址。`:''));
  try{
   const result=await ton.sendTransaction({validUntil:Math.floor(Date.now()/1000)+300,network:'-239',from:wallet.account.address,messages:pick.map(r=>({address:r.address,amount:plan.amountNanos,payload:plan.payload}))});
   if(!result?.boc)throw new Error('钱包没有返回可核验的签名 BoC；付款状态不确定');
