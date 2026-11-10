@@ -1,7 +1,9 @@
-import {parseAmount,amountString,rowsOf,exactMemo,sha256String,getMaxMessages,readableError,stableGroup,canonicalRecipientKey,tonConnectErrorCode,isTonConnectUserRejection,isRetryablePaymentRecord,hasPaymentProof,UNKNOWN_PAYMENT_STATUSES,EXPLICIT_CANCEL_PAYMENT_STATUSES,matchingPaymentAttempts,isReviewablePaymentHistory,isSendablePaymentHistory,reviewablePaymentAttempts,matchesMemoHash} from './logic.mjs';
+import {parseAmount,amountString,rowsOf,exactMemo,sha256String,getMaxMessages,readableError,stableGroup,canonicalRecipientKey,tonConnectErrorCode,isTonConnectUserRejection,isRetryablePaymentRecord,hasPaymentProof,UNKNOWN_PAYMENT_STATUSES,EXPLICIT_CANCEL_PAYMENT_STATUSES,matchingPaymentAttempts,isSendablePaymentHistory,reviewablePaymentAttempts,matchesMemoHash,isConfirmedPaidRecord,CONFIRMED_PAYMENT_STATUS,RETRYABLE_PAYMENT_STATUSES,uniqueAttemptKey,getSafeBatchSize,blockingPaymentAttempts} from './logic.mjs';
 const $=id=>document.getElementById(id);
 const LEDGER_KEY='gram_tonkeeper_payment_ledger_v1';
 let ton=null, core=null, wallet=null, plan=null, busy=false, connectingReady=false;
+const activeAttemptKeys=new Map();
+let paidThisRun=new Set();
 let ledger=loadLedger();
 let logs=[];
 function loadLedger(){try{const o=JSON.parse(localStorage.getItem(LEDGER_KEY)||'{}'); return (o&&o.version===1&&o.attempts&&typeof o.attempts==='object')?o:{version:1,attempts:{}};}catch{return {version:1,attempts:{}};}}
@@ -9,7 +11,16 @@ function saveLedger(){localStorage.setItem(LEDGER_KEY,JSON.stringify(ledger));}
 function info(msg,kind=''){const el=$('banner');el.textContent=msg;el.className='notice '+kind;}
 function progress(s,kind=''){const el=$('progress');el.textContent=s;el.className='notice '+(kind||'subdued');}
 function log(msg){const line=`${new Date().toLocaleString()} | ${msg}`;logs.push(line); $('log').textContent=logs.slice(-100).join('\n');}
-function setSendLabel(){const n=pendingRecipients().length; $('send').textContent=busy?'操作处理中…':(n?'向 Tonkeeper 提交下一批（'+n+'条待审核）':'无可发送的记录');$('send').disabled=busy||!plan||!wallet||!connectingReady||!$('approved').checked||!n;}
+function setSendLabel(){
+ const n=pendingRecipients().length, blockers=batchBlockingAttempts().length;
+ const paidReady=plan?plan.recipients.filter(r=>{const e=recordEntries(r);return isSendablePaymentHistory(e)&&e.some(x=>isConfirmedPaidRecord(x.record))&&!paidThisRun.has(r.raw);}).length:0;
+ if(busy)$('send').textContent='操作处理中…';
+ else if(blockers)$('send').textContent=`先核验上一批（${blockers}条）`;
+ else if(n)$('send').textContent='向 Tonkeeper 提交下一批（本批最多90条）';
+ else if(paidReady&&!$('allow-repeat-paid').checked)$('send').textContent='已付款地址需勾选后才能再次付款';
+ else $('send').textContent='无可发送的记录';
+ $('send').disabled=busy||!plan||!wallet||!connectingReady||!$('approved').checked||!n||blockers>0;
+}
 function rawAddr(addr){return core.Address.parse(addr).toRawString();}
 function walletRaw(){return wallet?rawAddr(wallet.account.address):'';}
 function normalizeAddress(str){const parsed=core.Address.parseFriendly(str);if(parsed.isTestOnly)throw new Error('检测到测试网地址，当前仅支持主网');return {raw:parsed.address.toRawString(),address:parsed.address.toString({urlSafe:true,testOnly:false,bounceable:parsed.isBounceable})};}
@@ -23,21 +34,42 @@ function recordEntries(r){
 function getRecord(r){
  const entries=recordEntries(r);if(!entries.length)return null;
  const records=entries.map(x=>x.record),latest=entries[entries.length-1].record;
+ const paidCount=records.filter(isConfirmedPaidRecord).length;
+ if(isSendablePaymentHistory(entries)){
+  if(paidCount)return {...latest,status:`已链上确认付款${paidCount}次·可再次付款（需勾选）`,historyAttemptCount:entries.length};
+  return {...latest,historyAttemptCount:entries.length};
+ }
  const proof=entries.filter(x=>hasPaymentProof(x.record));
  if(proof.length){
-  const confirmed=proof.some(x=>x.record.status==='链上收款侧已核实');
+  const unresolved=records.filter(a=>!isConfirmedPaidRecord(a)&&!(isRetryablePaymentRecord(a)&&!hasPaymentProof(a))).length;
   const signed=proof.filter(x=>x.record.externalHash||x.record.recipientMessageHash).length;
-  return {...latest,status:confirmed?'链上已核实历史付款·禁止重发':`历史签名/消息哈希待链上核验（${signed}条）`,historyAttemptCount:entries.length};
+  return {...latest,status:paidCount?`已有${paidCount}次链上确认付款，另有${unresolved}条历史尝试待核验·禁止重发`:`历史签名/消息哈希待链上核验（${signed}条）`,historyAttemptCount:entries.length};
  }
- if(records.every(isRetryablePaymentRecord))return {...latest,historyAttemptCount:entries.length};
  const unknown=records.filter(a=>UNKNOWN_PAYMENT_STATUSES.has(a.status)).length;
  if(unknown)return {...latest,status:`历史尝试待人工确认（${unknown}条）`,historyAttemptCount:entries.length};
  if(records.some(a=>EXPLICIT_CANCEL_PAYMENT_STATUSES.has(a.status)))return {...latest,status:'用户已取消·未签名',historyAttemptCount:entries.length};
  return {...latest,status:'历史记录状态需先复核·禁止重发',historyAttemptCount:entries.length};
 }
 function isSendableRecord(r){return isSendablePaymentHistory(recordEntries(r));}
-function pendingRecipients(){return plan?plan.recipients.filter(isSendableRecord):[];}
-function reviewableHistoryEntries(r){return isReviewablePaymentHistory(recordEntries(r))?recordEntries(r):[];}
+function pendingRecipients(){
+ if(!plan)return [];
+ const allowRepeat=$('allow-repeat-paid').checked;
+ return plan.recipients.filter(r=>{
+  const entries=recordEntries(r);if(!isSendablePaymentHistory(entries))return false;
+  const paid=entries.some(x=>isConfirmedPaidRecord(x.record));
+  if(paid&&(!allowRepeat||paidThisRun.has(r.raw)))return false;
+  return true;
+ });
+}
+function batchBlockingAttempts(){
+ if(!wallet||!plan)return [];
+ const currentRecipients=new Set(plan.recipients.map(r=>r.raw));
+ return blockingPaymentAttempts(ledger.attempts,walletRaw(),plan.amountNanos).filter(([,r])=>currentRecipients.has(r.recipient));
+}
+function reviewableHistoryEntries(r){
+ const entries=recordEntries(r);
+ return reviewablePaymentAttempts(entries,new Set([...UNKNOWN_PAYMENT_STATUSES,...EXPLICIT_CANCEL_PAYMENT_STATUSES,...RETRYABLE_PAYMENT_STATUSES]));
+}
 function summarizeHistory(){
  let addresses=0,attempts=0,hashAddresses=0,manualAddresses=0;
  if(!wallet||!plan)return {addresses,attempts,hashAddresses,manualAddresses};
@@ -56,10 +88,11 @@ function b64Bytes(s){return Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/
 function download(name,content,type='application/json;charset=utf-8'){
  const blob=new Blob([content],{type});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
 }
-function resetPreview(){plan=null;$('approved').checked=false;$('rows').replaceChildren();$('count').textContent='—';$('per').textContent='—';$('total').textContent='—';$('summary').textContent='输入变化后需要重新校验，旧清单不会直接用于付款';setSendLabel();}
+function resetPreview(){plan=null;paidThisRun=new Set();$('approved').checked=false;$('rows').replaceChildren();$('count').textContent='—';$('per').textContent='—';$('total').textContent='—';$('summary').textContent='输入变化后需要重新校验，旧清单不会直接用于付款';setSendLabel();}
 function markMemo(){const s=$('memo').value;const bytes=new TextEncoder().encode(s);$('memo-info').textContent=`${bytes.length} UTF-8 字节 | ${s.split('\n').length} 行 | ${s.endsWith('\n')?'末尾有换行':'末尾无换行'}`;$('memo-markers').textContent=s.replaceAll(' ','·').replaceAll('\t','⇥').replaceAll('\n','↵\n');$('memo-sha').textContent='';}
 for(const id of ['recipients','memo','amount','batch-size'])$(id).addEventListener('input',()=>{resetPreview();if(id==='memo')markMemo();});
 $('approved').addEventListener('change',setSendLabel);
+$('allow-repeat-paid').addEventListener('change',()=>{paintTable();progress($('allow-repeat-paid').checked?'已启用重复付款：仅允许链上确认到账且无未核验历史尝试的地址进入新付款批次。请逐项核对后再确认。':'已关闭重复付款：已链上确认的历史付款地址不会进入本轮待付款队列。','warn');});
 function paintTable(){
  const target=$('rows');target.replaceChildren();if(!plan)return;
  for(const [i,r] of plan.recipients.entries()){
@@ -82,7 +115,7 @@ async function validate(){
   const payload=cell.toBoc().toString('base64');
   const memoHash=await cryptoHex(bytes),memoBytes=bytes.length;
   const next={recipients:all,amountNanos:String(amount),memo,memoHash,memoBytes,payload,network:'-239'};
-  next.planHash=await sha256String(stableGroup(next));plan=next;
+  next.planHash=await sha256String(stableGroup(next));plan=next;paidThisRun=new Set();
   $('count').textContent=String(all.length);$('per').textContent=amountString(amount)+' GRAM';$('total').textContent=amountString(amount*BigInt(all.length))+' GRAM';
   $('memo-sha').textContent=`评论SHA256 ${memoHash}`;
   const audit=summarizeHistory();
@@ -94,12 +127,12 @@ async function validate(){
 }
 $('validate').addEventListener('click',validate);
 function walletFeature(){return wallet?getMaxMessages(wallet):0;}
-function getCap(){return Math.min(Number($('batch-size').value),walletFeature());}
+function getCap(){return getSafeBatchSize($('batch-size').value,walletFeature());}
 function status(){
  if(!wallet){$('wallet-info').textContent='尚未连接钱包';$('wallet-capacity').textContent='连接后显示钱包支持的最大消息数';setSendLabel();return;}
  const addr=wallet.account.address;
  $('wallet-info').textContent=`${addr} | ${wallet.account.chain==='-239'?'主网':'非主网（禁止付款）'}`;
- $('wallet-capacity').textContent=`钱包报告单批最多 ${walletFeature()} 条内部消息；当前设置 ${$('batch-size').value} 条，实际单批 ${getCap()} 条。`;
+ $('wallet-capacity').textContent=`钱包报告单批最多 ${walletFeature()} 条内部消息；本工具单批硬上限90条；当前设置 ${$('batch-size').value} 条，实际单批 ${getCap()} 条。`;
  setSendLabel();paintTable();
 }
 $('balance-btn').addEventListener('click',async()=>{
@@ -165,8 +198,13 @@ function storeAttemptAtKey(key,sender,snap,rec,fields,persist=true){
  if(persist)saveLedger();
 }
 function storeAttempt(sender,snap,rec,fields){
- const key=canonicalRecipientKey(sender,rec.raw,snap.amountNanos,snap.memoHash);
+ let key=activeAttemptKeys.get(rec.raw);
+ if(fields.status==='已请求钱包确认·请核实'||!key){
+  const id=(typeof crypto.randomUUID==='function'?crypto.randomUUID():`${Date.now().toString(36)}-${Math.random().toString(36).slice(2,12)}`);
+  key=uniqueAttemptKey(sender,rec.raw,snap.amountNanos,snap.memoHash,id);activeAttemptKeys.set(rec.raw,key);
+ }
  storeAttemptAtKey(key,sender,snap,rec,fields,true);
+ if(fields.status!=='已请求钱包确认·请核实')activeAttemptKeys.delete(rec.raw);
 }
 function storeHistoricalAttempt(entry,sender,snap,rec,fields,persist=true){
  storeAttemptAtKey(entry.key,sender,snap,rec,fields,persist);
@@ -175,13 +213,17 @@ function markAttempt(rec,fields){storeAttempt(walletRaw(),plan,rec,fields);}
 $('send').addEventListener('click',async()=>{
  if(busy||!wallet||!plan||!connectingReady||!$('approved').checked)return;
  if(wallet.account.chain!=='-239'){progress('当前钱包不是 TON 主网，已阻止付款','warn');return;}
+ const blockers=batchBlockingAttempts();if(blockers.length){progress(`上一批仍有 ${blockers.length} 条历史尝试未完成链上核验或人工复核，暂时不能提交下一批。请先处理上一批。`,'warn');return;}
  const free=pendingRecipients();if(!free.length)return;
  const cap=getCap();if(cap<1)return;
  const pick=free.slice(0,cap);
+ if(pick.length>90){progress('本工具单批硬上限为90条，已阻止超限提交。','warn');return;}
  if(pick.some(x=>x.raw===walletRaw())){progress('收款清单包含付款钱包自身地址，已停止；请复核','warn');return;}
  const senderBefore=walletRaw(),snap=plan;
  const total=BigInt(plan.amountNanos)*BigInt(pick.length);
- const dialog=`即将请求 Tonkeeper 签名主网转账\n\n付款钱包：${wallet.account.address}\n本批收款：${pick.length} 条\n每笔：${amountString(BigInt(plan.amountNanos))} GRAM\n本批本金：${amountString(total)} GRAM + 手续费\n评论SHA256：${plan.memoHash}\n\n签名确认后可能立即发生真实不可撤销付款。\n请先在 Tonkeeper 中再次核对收款地址与金额。\n\n要继续打开 Tonkeeper 确认吗？`;
+ const repeatCount=pick.filter(r=>recordEntries(r).some(x=>isConfirmedPaidRecord(x.record))).length;
+ const repeatNotice=repeatCount?`\n其中 ${repeatCount} 个地址此前已链上确认到账，本批将再次付款。`:'\n本批不包含此前已链上确认到账的重复付款地址。';
+ const dialog=`即将请求 Tonkeeper 签名主网转账\n\n付款钱包：${wallet.account.address}\n本批收款：${pick.length} 条\n每笔：${amountString(BigInt(plan.amountNanos))} GRAM\n本批本金：${amountString(total)} GRAM + 手续费\n评论SHA256：${plan.memoHash}${repeatNotice}\n\n签名确认后可能立即发生真实不可撤销付款。\n请先在 Tonkeeper 中再次核对收款地址与金额。\n\n要继续打开 Tonkeeper 确认吗？`;
  if(!confirm(dialog))return;
  busy=true;setSendLabel();
  const at=new Date().toISOString();
@@ -240,8 +282,8 @@ $('review-unknown').addEventListener('click',()=>{
  const rows=reviewCandidates(UNKNOWN_PAYMENT_STATUSES);
  const count=rows.reduce((n,x)=>n+x.entries.length,0);
  if(!count){
-  const signed=plan.recipients.filter(r=>recordEntries(r).some(x=>hasPaymentProof(x.record))).length;
-  progress(signed?`当前有 ${signed} 个地址存在历史签名/收款消息哈希，必须先点击「检查待确认交易」核验；不能用人工未发送确认解锁。`:'当前没有符合条件的无签名哈希历史尝试。若记录存在其他核验状态，必须先查链上或人工复核。','warn');
+  const signed=plan.recipients.filter(r=>recordEntries(r).some(x=>hasPaymentProof(x.record)&&!isConfirmedPaidRecord(x.record))).length;
+  progress(signed?`当前有 ${signed} 个地址存在尚未核验的历史签名/收款消息哈希，必须先点击「检查待确认交易」；不能用人工未发送确认解锁。`:'当前没有可人工确认未发送的无哈希未知尝试。已链上确认的付款记录如需再次付款，请勾选「允许已链上确认到账的地址再次付款」。','warn');
   return;
  }
  const ok=confirm(`将审核 ${rows.length} 个收款地址、${count} 条历史尝试。\n\n历史尝试时间：${reviewTimes(rows)}\n付款钱包：${wallet.account.address}\n\n必须逐一检查原付款钱包在以上所有时间段的交易历史，确认没有对应出账记录、没有完成签名，并确认这些请求确实没有发送。\n\n“Transaction was not sent”错误本身不能证明未广播。如果无法确定，请取消并继续保持锁定。\n\n确认后只会把这些无哈希历史记录标记为人工重新审核，不会自动发送。`);
@@ -312,7 +354,7 @@ $('verify').addEventListener('click',async()=>{
    if(checked.kind!=='per-recipient'){log(h+': '+checked.message);continue;}
    for(const item of checked.results){
     if(item.kind==='confirmed'){
-     storeHistoricalAttempt(item.r,senderBefore,snap,item.r.object,{status:'链上收款侧已核实',recipientTxHash:item.recipientTxHash,outgoingHash:item.outgoingHash,confirmedAt:new Date().toISOString()},false);verified++;
+     storeHistoricalAttempt(item.r,senderBefore,snap,item.r.object,{status:CONFIRMED_PAYMENT_STATUS,recipientTxHash:item.recipientTxHash,outgoingHash:item.outgoingHash,confirmedAt:new Date().toISOString()},false);paidThisRun.add(item.r.object.raw);verified++;
     }else if(item.kind==='review'){
      storeHistoricalAttempt(item.r,senderBefore,snap,item.r.object,{status:'需人工复核',verifyDetail:item.reason},false);review++;
     } else storeHistoricalAttempt(item.r,senderBefore,snap,item.r.object,{status:'链上处理中·待核实',verifyDetail:item.reason},false);
@@ -329,7 +371,9 @@ $('ledger-file').addEventListener('change',async e=>{
  try{const j=JSON.parse(await f.text());if(j.version!==1||!j.attempts||typeof j.attempts!=='object')throw new Error('记录文件格式不正确');
   let added=0;for(const [key,v] of Object.entries(j.attempts)){
    if(!v||typeof v!=='object'||!['sender','recipient','amountNanos','memoHash','status'].every(k=>typeof v[k]==='string'))throw new Error('存在格式错误的付款记录');
-   if(key!==canonicalRecipientKey(v.sender,v.recipient,v.amountNanos,v.memoHash))throw new Error('记录键值校验失败');
+   const base=canonicalRecipientKey(v.sender,v.recipient,v.amountNanos,v.memoHash);
+   const attemptSuffix=key.startsWith(base+'|attempt:')?key.slice((base+'|attempt:').length):'';
+   if(key!==base&&!/^[A-Za-z0-9-]{8,80}$/.test(attemptSuffix))throw new Error('记录键值校验失败');
    // Never overwrite or downgrade existing local payment proof/status.
    if(!ledger.attempts[key]){ledger.attempts[key]=v;added++;}
   }saveLedger();paintTable();progress('已合并 '+added+' 条历史记录，原本已有的记录没有被覆盖。','ok');
@@ -343,7 +387,7 @@ $('export-plan').addEventListener('click',()=>{
 $('export-log').addEventListener('click',()=>download('GRAM_付款操作日志.txt',logs.join('\n')+'\n','text/plain;charset=utf-8'));
 (async()=>{
  try{core=await import('https://esm.sh/@ton/core@0.63.1?bundle');
-  log('TON Core 已载入：支持地址校验、评论 Cell 编码和链上哈希核验');
+  log('V2.2 TON Core 已载入：支持地址校验、评论 Cell 编码、独立付款尝试记录和链上哈希核验');
   await prepareTonConnect();
   markMemo();
  }catch(e){info('加载 TON 核心依赖失败：'+readableError(e)+'。请检查浏览器网络，当前不能执行付款。','warn');log(readableError(e));}
