@@ -47,3 +47,26 @@ export function stableGroup(plan){
 export function canonicalRecipientKey(sender,rcpt,amountNanos,memoHash){
   return `${sender}|${rcpt}|${amountNanos}|${memoHash}`;
 }
+
+
+// TON Connect sendTransaction rejection helpers. Only an explicit wallet rejection
+// (code 300 / UserRejectsError) is classified as a definite user cancellation.
+export function tonConnectErrorCode(error){
+  const values=[error?.code,error?.walletError?.code,error?.data?.code,error?.cause?.code,error?.walletError?.data?.code];
+  for(const value of values){
+    if(value===undefined||value===null||value==='')continue;
+    const n=Number(value);
+    if(Number.isInteger(n))return n;
+  }
+  return null;
+}
+export function isTonConnectUserRejection(error){
+  return tonConnectErrorCode(error)===300 || error?.name==='UserRejectsError' || error?.constructor?.name==='UserRejectsError';
+}
+export const RETRYABLE_PAYMENT_STATUSES=new Set([
+  '用户已取消·已重新审核',
+  '人工确认未发送·已重新审核'
+]);
+export function isRetryablePaymentRecord(record){
+  return !!record && RETRYABLE_PAYMENT_STATUSES.has(record.status);
+}
