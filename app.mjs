@@ -1,4 +1,4 @@
-import {parseAmount,amountString,rowsOf,exactMemo,sha256String,getMaxMessages,readableError,stableGroup,canonicalRecipientKey,tonConnectErrorCode,isTonConnectUserRejection,isRetryablePaymentRecord,hasPaymentProof,UNKNOWN_PAYMENT_STATUSES,EXPLICIT_CANCEL_PAYMENT_STATUSES,matchingPaymentAttempts,isSendablePaymentHistory,reviewablePaymentAttempts,matchesMemoHash,isConfirmedPaidRecord,CONFIRMED_PAYMENT_STATUS,RETRYABLE_PAYMENT_STATUSES,uniqueAttemptKey,getSafeBatchSize,blockingPaymentAttempts} from './logic.mjs';
+import {parseAmount,amountString,rowsOf,exactMemo,sha256String,getMaxMessages,readableError,stableGroup,canonicalRecipientKey,tonConnectErrorCode,isTonConnectUserRejection,hasPaymentProof,UNKNOWN_PAYMENT_STATUSES,EXPLICIT_CANCEL_PAYMENT_STATUSES,matchingPaymentAttempts,isSendablePaymentHistory,reviewablePaymentAttempts,matchesMemoHash,isConfirmedPaidRecord,CONFIRMED_PAYMENT_STATUS,RETRYABLE_PAYMENT_STATUSES,uniqueAttemptKey,getSafeBatchSize,blockingPaymentAttempts} from './logic.mjs';
 const $=id=>document.getElementById(id);
 const LEDGER_KEY='gram_tonkeeper_payment_ledger_v1';
 let ton=null, core=null, wallet=null, plan=null, busy=false, connectingReady=false;
@@ -39,20 +39,22 @@ function getRecord(r){
  const entries=recordEntries(r);if(!entries.length)return null;
  const records=entries.map(x=>x.record),latest=entries[entries.length-1].record;
  const paidCount=records.filter(isConfirmedPaidRecord).length;
- if(isSendablePaymentHistory(entries)){
+ const proof=entries.filter(x=>hasPaymentProof(x.record)&&!isConfirmedPaidRecord(x.record));
+ const sendable=isSendablePaymentHistory(entries);
+ if(proof.length){
+  const label=paidCount
+   ?`已确认到账${paidCount}次；另有${proof.length}条历史交易凭证未核实`
+   :`历史交易凭证未核实（${proof.length}条）`;
+  return {...latest,status:label+(sendable?'·允许再次付款（请核对）':'·另有无哈希结果未知记录需审核'),historyAttemptCount:entries.length};
+ }
+ if(sendable){
   if(paidCount)return {...latest,status:`已链上确认付款${paidCount}次·可再次付款（需勾选）`,historyAttemptCount:entries.length};
   return {...latest,historyAttemptCount:entries.length};
  }
- const proof=entries.filter(x=>hasPaymentProof(x.record));
- if(proof.length){
-  const unresolved=records.filter(a=>!isConfirmedPaidRecord(a)&&!(isRetryablePaymentRecord(a)&&!hasPaymentProof(a))).length;
-  const signed=proof.filter(x=>x.record.externalHash||x.record.recipientMessageHash).length;
-  return {...latest,status:paidCount?`已有${paidCount}次链上确认付款，另有${unresolved}条历史尝试待核验·禁止重发`:`历史签名/消息哈希待链上核验（${signed}条）`,historyAttemptCount:entries.length};
- }
- const unknown=records.filter(a=>UNKNOWN_PAYMENT_STATUSES.has(a.status)).length;
- if(unknown)return {...latest,status:`历史尝试待人工确认（${unknown}条）`,historyAttemptCount:entries.length};
- if(records.some(a=>EXPLICIT_CANCEL_PAYMENT_STATUSES.has(a.status)))return {...latest,status:'用户已取消·未签名',historyAttemptCount:entries.length};
- return {...latest,status:'历史记录状态需先复核·禁止重发',historyAttemptCount:entries.length};
+ const unknown=records.filter(a=>UNKNOWN_PAYMENT_STATUSES.has(a.status)&&!hasPaymentProof(a)).length;
+ if(unknown)return {...latest,status:`无哈希结果未知（${unknown}条）·仍需人工审核`,historyAttemptCount:entries.length};
+ if(records.some(a=>EXPLICIT_CANCEL_PAYMENT_STATUSES.has(a.status)))return {...latest,status:'用户已取消·未签名（需重新审核）',historyAttemptCount:entries.length};
+ return {...latest,status:'历史记录状态需先复核·暂不可发送',historyAttemptCount:entries.length};
 }
 function isSendableRecord(r){return isSendablePaymentHistory(recordEntries(r));}
 function pendingRecipients(){
@@ -220,10 +222,11 @@ $('send').addEventListener('click',async()=>{
  const free=pendingRecipients();
  if(!free.length){
   const blocked=blockedAddressCount();
-  progress(blocked?`当前没有可发送地址；${blocked}个地址仍有签名/结果未知的历史尝试，必须先核验这些地址。`:'当前没有可发送的记录。请检查重复付款选项和付款清单。','warn');
+  progress(blocked?`当前没有可发送地址；${blocked}个地址存在无哈希的结果未知记录，仍需先人工审核。`:'当前没有可发送的记录。请检查重复付款选项和付款清单。','warn');
   return;
  }
- // Unresolved attempts lock only their own recipient; unrelated clean recipients can proceed.
+ // Hash-bearing unresolved attempts may be resent under the user-requested policy.
+ // Hashless unknown outcomes remain blocked pending manual review.
  const blocked=blockedAddressCount();
  const cap=getCap();if(cap<1)return;
  const pick=free.slice(0,cap);
@@ -233,8 +236,10 @@ $('send').addEventListener('click',async()=>{
  const total=BigInt(plan.amountNanos)*BigInt(pick.length);
  const repeatCount=pick.filter(r=>recordEntries(r).some(x=>isConfirmedPaidRecord(x.record))).length;
  const repeatNotice=repeatCount?`\n其中 ${repeatCount} 个地址此前已链上确认到账，本批将再次付款。`:'\n本批不包含此前已链上确认到账的重复付款地址。';
- const skipNotice=blocked?`\n另有 ${blocked} 个地址存在未核验历史，本轮已单独跳过；不会阻止本批其他无异常地址付款。`:'';
- const dialog=`即将请求 Tonkeeper 签名主网转账\n\n付款钱包：${wallet.account.address}\n本批收款：${pick.length} 条\n每笔：${amountString(BigInt(plan.amountNanos))} GRAM\n本批本金：${amountString(total)} GRAM + 手续费\n评论SHA256：${plan.memoHash}${repeatNotice}${skipNotice}\n\n签名确认后可能立即发生真实不可撤销付款。\n请先在 Tonkeeper 中再次核对收款地址与金额。\n\n要继续打开 Tonkeeper 确认吗？`;
+ const unresolvedHashCount=pick.filter(r=>recordEntries(r).some(x=>hasPaymentProof(x.record)&&!isConfirmedPaidRecord(x.record))).length;
+ const unresolvedNotice=unresolvedHashCount?`\n警告：其中 ${unresolvedHashCount} 个地址存在历史交易哈希但尚未确认收款。本次仍允许再次付款；如果旧交易实际已到账，可能造成重复付款。`:'';
+ const skipNotice=blocked?`\n另有 ${blocked} 个地址存在无哈希的结果未知记录，本轮仍单独跳过。`:'';
+ const dialog=`即将请求 Tonkeeper 签名主网转账\n\n付款钱包：${wallet.account.address}\n本批收款：${pick.length} 条\n每笔：${amountString(BigInt(plan.amountNanos))} GRAM\n本批本金：${amountString(total)} GRAM + 手续费\n评论SHA256：${plan.memoHash}${repeatNotice}${unresolvedNotice}${skipNotice}\n\n签名确认后可能立即发生真实不可撤销付款。\n请先在 Tonkeeper 中再次核对收款地址与金额。\n\n要继续打开 Tonkeeper 确认吗？`;
  if(!confirm(dialog))return;
  busy=true;setSendLabel();
  const at=new Date().toISOString();
@@ -259,7 +264,7 @@ $('send').addEventListener('click',async()=>{
    log('钱包明确返回 USER_REJECTS_ERROR 300；本批标记为用户取消，等待人工重新审核');
   }else{
    for(const r of pick)storeAttempt(senderBefore,snap,r,{status:'付款结果不确定·禁止自动重试',error:errorText});
-   progress('付款请求返回错误或结果未知：'+errorText+'。该批继续锁定；先核对 Tonkeeper 历史，确认没有签名/出账后才能人工重新审核。','warn');
+   progress('付款请求返回错误或结果未知：'+errorText+'。该批无哈希记录仍需人工审核；如果之后出现交易哈希，按当前设置可再次发起付款，但务必先核对是否已到账。','warn');
    log('钱包交互异常，付款状态未知并锁定该批：'+errorText);
   }
  }finally{busy=false;paintTable();}
@@ -294,7 +299,7 @@ $('review-unknown').addEventListener('click',()=>{
  const count=rows.reduce((n,x)=>n+x.entries.length,0);
  if(!count){
   const signed=plan.recipients.filter(r=>recordEntries(r).some(x=>hasPaymentProof(x.record)&&!isConfirmedPaidRecord(x.record))).length;
-  progress(signed?`当前有 ${signed} 个地址存在尚未核验的历史签名/收款消息哈希，必须先点击「检查待确认交易」；不能用人工未发送确认解锁。`:'当前没有可人工确认未发送的无哈希未知尝试。已链上确认的付款记录如需再次付款，请勾选「允许已链上确认到账的地址再次付款」。','warn');
+  progress(signed?`当前有 ${signed} 个地址存在尚未核验的历史交易哈希；按当前设置，这些地址允许再次付款，但建议先点击「检查待确认交易」核对。`:'当前没有可人工确认未发送的无哈希未知尝试。已链上确认的付款记录如需再次付款，请勾选「允许已链上确认到账的地址再次付款」。','warn');
   return;
  }
  const ok=confirm(`将审核 ${rows.length} 个收款地址、${count} 条历史尝试。\n\n历史尝试时间：${reviewTimes(rows)}\n付款钱包：${wallet.account.address}\n\n必须逐一检查原付款钱包在以上所有时间段的交易历史，确认没有对应出账记录、没有完成签名，并确认这些请求确实没有发送。\n\n“Transaction was not sent”错误本身不能证明未广播。如果无法确定，请取消并继续保持锁定。\n\n确认后只会把这些无哈希历史记录标记为人工重新审核，不会自动发送。`);
@@ -353,8 +358,8 @@ $('verify').addEventListener('click',async()=>{
   }
   const groups=new Map();for(const a of pending){const k=a.externalHash;if(!groups.has(k))groups.set(k,[]);groups.get(k).push(a);}
   if(!groups.size){
-   const messageOnly=plan.recipients.reduce((n,r)=>n+recordEntries(r).filter(x=>x.record.recipientMessageHash&&!x.record.externalHash).length,0);
-   progress(messageOnly?`发现 ${messageOnly} 条收款消息哈希但没有外部消息哈希的记录，不能自动解锁；请在 TON 链上浏览器和 Tonkeeper 历史中人工核对。`:'没有当前付款钱包下带外部消息哈希且尚未核验的历史尝试。无哈希结果未知记录仍需人工检查钱包历史。','warn');
+   const proofWithoutExternalHash=plan.recipients.reduce((n,r)=>n+recordEntries(r).filter(x=>hasPaymentProof(x.record)&&!x.record.externalHash).length,0);
+   progress(proofWithoutExternalHash?`发现 ${proofWithoutExternalHash} 条存在出账/收款侧交易哈希、但没有外部消息哈希的记录，不能自动解锁；请在 TON 链上浏览器和 Tonkeeper 历史中人工核对。`:'没有当前付款钱包下带外部消息哈希且尚未核验的历史尝试。无哈希结果未知记录仍需人工检查钱包历史。','warn');
    return;
   }
   let verified=0,review=0;
