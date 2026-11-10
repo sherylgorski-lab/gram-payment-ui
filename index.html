@@ -4,7 +4,7 @@
 <script defer src="https://unpkg.com/@tonconnect/ui@5.0.2/dist/tonconnect-ui.min.js"></script>
 <script type="module" src="app.mjs"></script></head><body>
 <main class="wrap">
-<header class="top"><div><div class="eyebrow">表妹查询工具 · TON MAINNET</div><h1>表妹批量付款管理系统</h1><p>批量管理 GRAM 转账 · Tonkeeper 钱包内确认 · 不在网页中存储私钥</p></div><div class="tag">V2.2 · 重复付款与批次优化</div></header>
+<header class="top"><div><div class="eyebrow">表妹查询工具 · TON MAINNET</div><h1>表妹批量付款管理系统</h1><p>批量管理 GRAM 转账 · Tonkeeper 钱包内确认 · 不在网页中存储私钥</p></div><div class="tag">V2.2.1 · 地址独立锁定与重复付款优化</div></header>
 <div id="banner" class="notice">正在检查运行环境…</div>
 <section class="card"><div class="secthead"><h2>① 连接付款钱包</h2><span class="small">查询 Session 与付款钱包完全分离</span></div>
 <div class="row wraprow"><div id="ton-connect"></div><div id="wallet-info" class="mono muted">尚未连接</div><button class="ghost" id="balance-btn">查询链上余额</button></div>
@@ -21,11 +21,11 @@
 <div class="statsgrid"><div><span>收款地址</span><b id="count">—</b></div><div><span>每人金额</span><b id="per">—</b></div><div><span>本金合计</span><b id="total">—</b></div><div><span>网络手续费</span><b>由 Tonkeeper 显示</b></div></div>
 <div id="summary" class="muted small">先填写信息，再点击预览。</div>
 <div class="tablebox"><table><thead><tr><th>序号</th><th>用户名</th><th>地址</th><th>金额</th><th>付款记录</th></tr></thead><tbody id="rows"></tbody></table></div>
-<label class="check"><input type="checkbox" id="allow-repeat-paid"> 允许已链上确认到账的地址再次付款（默认关闭；有未核验历史尝试的地址仍会锁定）</label>
+<label class="check"><input type="checkbox" id="allow-repeat-paid" checked> 允许已链上确认到账的地址再次付款（默认开启；未核验/结果未知的地址仍单独锁定）</label>
 <label class="check"><input type="checkbox" id="approved"> 我已逐项核对收款地址、金额、评论，明白链上转账通常不可撤销；只向有权发送的地址付款。</label>
 <div class="row wraprow"><button id="send" class="danger" disabled>请先预览并连接钱包</button><button id="verify" class="ghost">检查待确认交易</button><button id="review-cancelled" class="ghost">重新审核明确取消记录</button><button id="review-unknown" class="ghost">人工确认未发送（先核对钱包历史）</button><button id="export-ledger" class="ghost">备份付款记录 JSON</button><label class="filebutton">恢复付款记录<input type="file" id="ledger-file" accept=".json,application/json"></label></div>
-<div id="progress" class="notice subdued">单批硬上限90条；上一批有签名待核验或结果未知时，下一批会暂停。链上确认到账的地址默认不重复进入本轮队列；勾选“允许已付款地址再次付款”后，可在新一轮手动付款。连接中断、超时或结果未知仍会锁定。</div></section>
-<section class="card"><h2>⑤ 付款记录和风控</h2><p class="muted small">V2.2 按付款钱包、收款地址和金额匹配全部独立付款尝试，不再用评论SHA256把同一付款拆成互不相认的记录；同一地址的历史尝试会统一检查，只要仍有未核验记录就保持锁定。所有历史尝试均已链上确认或完成无哈希人工复核后，可勾选重复付款选项再次付款。钱包明确返回取消代码 300 时会标记为「用户已取消·未签名」。通用错误、超时和断线仍按结果未知锁定；只有逐一检查所有历史时间段的钱包出账记录后，才能使用人工确认入口重新审核。「Transaction was not sent」本身不能证明未广播。任何签名/收款消息哈希或其他链上核验状态都不能用人工未发送确认解锁，必须先查链上。重新审核只把记录放回待审核清单，不会自动发送。每次独立付款尝试使用单独记录键，重复付款不会覆盖旧交易哈希；每次状态变化保留最近 50 条历史。记录保存在当前浏览器中，重装服务器前要导出备份。</p>
+<div id="progress" class="notice subdued">单批硬上限90条；已链上确认到账的地址默认允许再次付款。存在签名/哈希待核验或结果未知记录的地址会单独锁定并跳过，不再阻止其他无异常地址继续付款。签名或结果未知的地址必须先核验；钱包或网络不保证每笔交易均被接受。</div></section>
+<section class="card"><h2>⑤ 付款记录和风控</h2><p class="muted small">V2.2.1 按付款钱包、收款地址和金额匹配全部独立付款尝试；同一地址的历史尝试单独判断。已链上确认到账的地址默认允许再次付款，每次重复付款使用独立记录键，不覆盖旧交易哈希。某个地址存在签名/消息哈希待核验或结果未知时，只锁定该地址并从待付款队列跳过，不再阻止同一清单中其他无异常地址继续提交。钱包明确返回取消代码 300 时标记为「用户已取消·未签名」。通用错误、超时、断线及签名待核验仍不能自动重试；必须先核对 Tonkeeper 历史和链上记录。此调整不能保证钱包、网络或链上处理必定成功；每批仍须在 Tonkeeper 内逐项确认。每次状态变化保留最近 50 条历史。记录保存在当前浏览器中，重装服务器前要导出备份。</p>
 <div class="row"><button id="export-plan" class="ghost">导出当前付款草稿</button><button id="export-log" class="ghost">导出操作日志</button></div><pre id="log" class="log"></pre></section>
 <footer>表妹批量付款管理系统 · 只接收用户手动发起的付款请求 · 不索取助记词/私钥 · 资产为 TON 主网原生 GRAM · 此工具不提供资金托管</footer>
 </main></body></html>
