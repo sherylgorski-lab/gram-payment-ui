@@ -35,6 +35,9 @@ export async function sha256String(text){
   const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(text));
   return Array.from(new Uint8Array(b),x=>x.toString(16).padStart(2,'0')).join('');
 }
+export async function matchesMemoHash(text,expectedHash){
+  return await sha256String(text)===expectedHash;
+}
 export function getMaxMessages(wallet){
   const f=(wallet?.device?.features||[]).find(x=>x && typeof x==='object' && x.name==='SendTransaction');
   const n=Number(f?.maxMessages);return Number.isInteger(n)&&n>0 ? n : 1;
@@ -67,6 +70,39 @@ export const RETRYABLE_PAYMENT_STATUSES=new Set([
   '用户已取消·已重新审核',
   '人工确认未发送·已重新审核'
 ]);
+export const UNKNOWN_PAYMENT_STATUSES=new Set([
+  '付款结果不确定·禁止自动重试',
+  '已请求钱包确认·请核实'
+]);
+export const EXPLICIT_CANCEL_PAYMENT_STATUSES=new Set([
+  '用户已取消·未签名'
+]);
 export function isRetryablePaymentRecord(record){
   return !!record && RETRYABLE_PAYMENT_STATUSES.has(record.status);
+}
+export function hasPaymentProof(record){
+  return !!record && ((typeof record.externalHash==='string' && record.externalHash.length>0) ||
+    (typeof record.recipientMessageHash==='string' && record.recipientMessageHash.length>0));
+}
+
+// Historical attempts are matched independently of memo hash. The memo hash stays
+// attached to each record for transaction verification, while send gating considers
+// every attempt for the same payer/recipient/amount identity.
+export function matchingPaymentAttempts(attempts,sender,recipient,amountNanos){
+  return Object.entries(attempts||{})
+    .filter(([,record])=>record&&record.sender===sender&&record.recipient===recipient&&String(record.amountNanos)===String(amountNanos))
+    .map(([key,record])=>({key,record}))
+    .sort((a,b)=>String(a.record.attemptedAt||a.record.updatedAt||'').localeCompare(String(b.record.attemptedAt||b.record.updatedAt||'')));
+}
+export function isReviewablePaymentHistory(entries){
+  if(!Array.isArray(entries)||!entries.length||entries.some(x=>hasPaymentProof(x?.record)))return false;
+  const allowed=new Set([...UNKNOWN_PAYMENT_STATUSES,...EXPLICIT_CANCEL_PAYMENT_STATUSES,...RETRYABLE_PAYMENT_STATUSES]);
+  return entries.every(x=>allowed.has(x?.record?.status));
+}
+export function isSendablePaymentHistory(entries){
+  return !Array.isArray(entries)||!entries.length||entries.every(x=>isRetryablePaymentRecord(x?.record));
+}
+export function reviewablePaymentAttempts(entries,statusSet){
+  if(!isReviewablePaymentHistory(entries))return [];
+  return entries.filter(x=>statusSet?.has(x?.record?.status));
 }
